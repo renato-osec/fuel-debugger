@@ -1,11 +1,19 @@
 use clap::Parser;
+use fuel_asm::RawInstruction;
 use fuel_debugger::names::register_name;
-use shellfish::async_fn;
+use fuel_types::Bytes32;
+use shellfish::command::CommandType;
+use shellfish::{async_fn, AsyncHandler};
 use shellfish::{Command as ShCommand, Shell};
+use surf::utils::async_trait;
+use std::collections::HashMap;
 use std::error::Error;
-
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use shellfish::command::Command;
 use fuel_debugger::{names, ContractId, FuelClient, RunResult, Transaction};
 use fuel_vm::consts::{VM_MAX_RAM, VM_REGISTER_COUNT, WORD_SIZE};
+use yansi::Paint;
 
 #[derive(Parser, Debug)]
 pub struct Opt {
@@ -13,16 +21,110 @@ pub struct Opt {
     pub api_url: String,
 }
 
+
+/// Shellfish's async handler with last-command repetition functionality
+#[derive(Clone)]
+pub struct RepeatLastCommandHandler {
+    last_command: Arc<Mutex<Option<Vec<String>>>>,
+}
+
+impl RepeatLastCommandHandler {
+    pub fn new() -> Self {
+        Self {
+            last_command: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+#[async_trait]
+impl<T: Send> AsyncHandler<T> for RepeatLastCommandHandler {
+    async fn handle_async(
+        &self,
+        mut line: Vec<String>,
+        commands: &HashMap<&str, Command<T>>,
+        state: &mut T,
+        description: &str,
+    ) -> bool {
+        // Use the last command if `line` is empty
+        if line.is_empty() {
+            let last_command = self.last_command.lock().await;
+            if let Some(last_cmd) = &*last_command {
+                println!("Repeating last command: {}", last_cmd.join(" "));
+                line = last_cmd.clone();
+            } else {
+                println!("No previous command to repeat.");
+                return false;
+            }
+        } else {
+            // Update the last command
+            *self.last_command.lock().await = Some(line.clone());
+        }
+
+        if let Some(command) = line.get(0) {
+            // Add some padding
+            println!();
+
+            match command.as_str() {
+                "quit" | "exit" => return true,
+                "help" => {
+                    println!("{}", description);
+                    // Print information about built-in commands
+                    println!("    help - displays help information.");
+                    println!("    quit - quits the shell.");
+                    println!("    exit - exits the shell.");
+                    for (name, command) in commands {
+                        println!("    {} - {}", name, command.help);
+                    }
+                }
+                _ => {
+                    // Attempt to find the command
+                    let command = commands.get(&line[0] as &str);
+
+                    // Check if we got it
+                    match command {
+                        Some(command) => {
+                            if let Err(e) = match command.command {
+                                CommandType::Sync(c) => c(state, line),
+                                CommandType::Async(a) => a(state, line).await,
+                            } {
+                                eprintln!(
+                                    "{}",
+                                    format!(
+                                        "Command exited unsuccessfully:\n{}\n({:?})",
+                                        &e, &e
+                                    )
+                                );
+                            }
+                        }
+                        None => {
+                            eprintln!("{} {}", Paint::red("Command not found:"), line[0]);
+                        }
+                    }
+                }
+            }
+
+            // Padding
+            println!();
+        }
+        false
+    }
+}
+
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Opt::parse();
 
-    let mut shell = Shell::new_async(
+    // Initialize the last command as an empty string wrapped in an Arc<Mutex<>>
+    let handler = RepeatLastCommandHandler::new();
+
+    let mut shell = Shell::new_with_async_handler(
         State {
             client: FuelClient::new(&config.api_url)?,
             session_id: String::new(), // Placeholder
         },
         ">> ",
+        handler
     );
 
     macro_rules! command {
@@ -38,13 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     command!(
         cmd_start_tx,
-        "path/to/tx.json -- start a new transaction",
+        "path/to/tx.json -- start a new tx",
         ["n", "tx", "new_tx", "start_tx"]
     );
     command!(
         cmd_reset,
         "-- reset, removing breakpoints and other state",
-        ["reset"]
+        ["reset", "clear"]
     );
     command!(
         cmd_continue,
@@ -66,7 +168,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[regname ...] -- dump registers",
         ["r", "reg", "register", "registers"]
     );
-    command!(cmd_memory, "[offset] limit -- dump memory", ["m", "memory"]);
+    command!(cmd_memory, "[offset] limit -- dump memory", ["m", "memory", "mem"]);
+    command!(cmd_code, "[offset] limit -- dump code", ["d", "disass", "code"]);
+    //get current call frame : [frame, fr (fr)]
+    command!(cmd_frame, "[offset] limit -- dump code", ["fr", "frame"]);
+    command!(
+        cmd_search_memory,
+        "[start] [end] pattern -- search memory",
+        ["search"]
+    );
 
     let session_id = shell.state.client.start_session().await?;
     shell.state.session_id = session_id.clone();
@@ -139,6 +249,8 @@ async fn cmd_continue(state: &mut State, mut args: Vec<String>) -> Result<(), Bo
     let status = state.client.continue_tx(&state.session_id).await?;
     pretty_print_run_result(&status);
 
+    cmd_code(state, vec!["code".to_string()]).await?;
+
     Ok(())
 }
 
@@ -199,14 +311,27 @@ async fn cmd_registers(state: &mut State, mut args: Vec<String>) -> Result<(), B
     if args.is_empty() {
         for r in 0..VM_REGISTER_COUNT {
             let value = state.client.register(&state.session_id, r as u32).await?;
-            println!("reg[{:#x}] = {:<8} # {}", r, value, register_name(r));
+            let name = register_name(r);
+            println!("reg[{:#x}] = {:<8} # {}", r, value, name);
         }
     } else {
         for arg in &args {
             if let Some(v) = parse_int(arg) {
                 if v < VM_REGISTER_COUNT {
                     let value = state.client.register(&state.session_id, v as u32).await?;
-                    println!("reg[{:#02x}] = {:<8} # {}", v, value, register_name(v));
+                    let name = register_name(v);
+                    println!("reg[{:#02x}] = {:<8} # {}", v, value, name);
+
+
+                    if name == "hp" {
+                        println!("heap size = {}", 2_u64.pow(26) - value);
+                    }
+
+                    if name == "sp" {
+                        //println!("stack size = {}", value - )
+                    }
+
+
                 } else {
                     println!("Register index too large {}", v);
                     return Ok(());
@@ -217,6 +342,12 @@ async fn cmd_registers(state: &mut State, mut args: Vec<String>) -> Result<(), B
                     .register(&state.session_id, index as u32)
                     .await?;
                 println!("reg[{:#02x}] = {:<8} # {}", index, value, arg);
+
+
+                if arg == "hp" {
+                    println!("heap size = {}", 2_u64.pow(26) - value);
+                }
+
             } else {
                 println!("Unknown register name {}", arg);
                 return Ok(());
@@ -261,6 +392,211 @@ async fn cmd_memory(state: &mut State, mut args: Vec<String>) -> Result<(), Box<
 
     Ok(())
 }
+
+async fn cmd_frame(state: &mut State, mut args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    args.remove(0);
+
+    if !args.is_empty() {
+        return Err(Box::new(ArgError::TooMany));
+    }
+
+    let fp = state.client.register(&state.session_id, 0x06 as u32).await?;
+
+    if fp == 0 {
+        println!("Not in an external call");
+        return Ok(())
+    }
+
+    let mem = state
+        .client
+        .memory(&state.session_id, fp as u32, 600 as u32)
+        .await?;
+
+    let to = Bytes32::new(mem[0..32].try_into().unwrap());
+    let asset_id = Bytes32::new(mem[32..64].try_into().unwrap());
+
+    println!("to        {}", to);
+    println!("asset_id  {}", asset_id);
+
+    println!("PREVIOUS_REGS :");
+    
+    for i in (64..576).step_by(8) {
+        let reg  = u64::from_be_bytes(mem[i..i+8].try_into().unwrap());
+
+        if reg != 0 {
+            let r = (i-64)/8;
+            let name = register_name(r);
+            println!("{} 0x{:x}", name , reg);
+        }
+    }
+
+    let codesize = u64::from_be_bytes(mem[576..584].try_into().unwrap());
+    println!("codesize 0x{:x}", codesize);
+
+    let param1 = u64::from_be_bytes(mem[584..592].try_into().unwrap());
+    let param2 = u64::from_be_bytes(mem[592..600].try_into().unwrap());
+    print!("param1 0x{:x}", param1);
+
+    let len = state
+        .client
+        .memory(&state.session_id, param1 as u32, 8 as u32)
+        .await?;
+
+    let fn_name = state
+        .client
+        .memory(&state.session_id, (param1+8) as u32, u64::from_be_bytes(len[0..8].try_into().unwrap()) as u32)
+        .await?;
+
+    if fn_name.iter().all(|&c| c.is_ascii()) {
+        unsafe {
+            let ascii_string = String::from_utf8_unchecked(fn_name.to_vec());
+            println!(" => \"{}\"", ascii_string);
+        }
+    } else {
+        println!(" => non-ascii? {:?}", fn_name);
+    }
+
+    print!("param2 0x{:x}", param2);
+
+    Ok(())
+}
+
+
+
+
+async fn cmd_code(state: &mut State, mut args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    args.remove(0);
+
+    let limit = args
+        .pop()
+        .map(|a| parse_int(&a).ok_or(ArgError::Invalid))
+        .transpose()?
+        .unwrap_or( 4 * (10 as usize));
+
+    let pc = state.client.register(&state.session_id, 0x03 as u32).await?;
+
+    let offset = args
+        .pop()
+        .map(|a| parse_int(&a).ok_or(ArgError::Invalid))
+        .transpose()?
+        .unwrap_or((pc-4*9) as usize);
+
+    if !args.is_empty() {
+        return Err(Box::new(ArgError::TooMany));
+    }
+
+    let mem = state
+        .client
+        .memory(&state.session_id, offset as u32, limit as u32)
+        .await?;
+
+    let instructions = fuel_asm::from_bytes(mem.iter().cloned())
+    .zip(mem.chunks(fuel_asm::Instruction::SIZE));
+
+    let mut instructions = instructions.enumerate().peekable();
+
+    while let Some((i, inst)) = instructions.next() {
+        if offset + i * 4 == pc as usize {
+            // This is the curret instruction
+            print!("=> {:06x}:", offset + i * 4);
+        } else {
+            print!("   {:06x}:", offset + i * 4);
+        }
+        println!(
+            " {:?}",
+            inst.0.unwrap_or(
+                RawInstruction::from_be_bytes([0x47, 0, 0, 0])
+                    .try_into()
+                    .unwrap()
+            )
+        );
+    }
+
+    Ok(())
+}
+
+fn parse_pattern(s: &str) -> Result<Vec<u8>, ArgError> {
+    let s = s.trim();
+
+    if let Some(stripped) = s.strip_prefix("0x") {
+        // Hex string
+        let s = stripped.replace('_', "");
+        if s.len() % 2 != 0 {
+            // Hex string must have an even number of characters
+            return Err(ArgError::Invalid);
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ArgError::Invalid))
+            .collect()
+    } else {
+        // Treat as ASCII string
+        Ok(s.as_bytes().to_vec())
+    }
+}
+
+
+async fn cmd_search_memory(state: &mut State, mut args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    args.remove(0); // Remove the command name
+
+    // The pattern is mandatory
+    let pattern_str = args.pop().ok_or(ArgError::NotEnough)?;
+
+    // End address is optional
+    let end = args
+        .pop()
+        .map(|a| parse_int(&a).ok_or(ArgError::Invalid))
+        .transpose()?
+        .unwrap_or(WORD_SIZE * (VM_MAX_RAM as usize));
+
+    // Start address is optional
+    let start = args
+        .pop()
+        .map(|a| parse_int(&a).ok_or(ArgError::Invalid))
+        .transpose()?
+        .unwrap_or(0);
+
+    if !args.is_empty() {
+        return Err(Box::new(ArgError::TooMany));
+    }
+
+    // Check that start <= end
+    if start > end {
+        return Err(Box::new(ArgError::Invalid));
+    }
+
+    // Parse the pattern
+    let pattern = parse_pattern(&pattern_str)?;
+
+    // Calculate the size to fetch
+    let size = end - start;
+
+    if size == 0 {
+        return Err(Box::new(ArgError::Invalid));
+    }
+
+    // Fetch the memory
+    let mem = state
+        .client
+        .memory(&state.session_id, start as u32, size as u32)
+        .await?;
+
+    // Search for pattern in mem
+    let mut found = false;
+    for (offset, window) in mem.windows(pattern.len()).enumerate() {
+        if window == pattern.as_slice() {
+            println!("Found pattern at address {:#x}", start + offset);
+            found = true;
+        }
+    }
+
+    if !found {
+        println!("Pattern not found in the specified memory range.");
+    }
+
+    Ok(())
+}
+
 
 fn parse_int(s: &str) -> Option<usize> {
     let (s, radix) = if let Some(stripped) = s.strip_prefix("0x") {

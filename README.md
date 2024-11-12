@@ -7,6 +7,4 @@
 
 Debugger attachable to FuelVM over a GraphQL API.
 
-## Testing
-
-The automated tests assume that `fuel-core` binary is installed.
+Fork of [Fuel Labs/fuel-debugger](https://github.com/FuelLabs/fuel-debugger), fixed and updated to work with the lastest version of FuelVM. Added features
